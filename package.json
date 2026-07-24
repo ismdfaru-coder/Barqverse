@@ -1,0 +1,35 @@
+{
+  "name": "use-ai-scraper",
+  "version": "1.0.0",
+  "description": "Scrape use.ai responses and integrate with React chat app",
+  "main": "backend-api.ts",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only backend-api.ts",
+    "build": "tsc",
+    "start": "node dist/backend-api.js",
+    "scraper:test": "ts-node use-ai-scraper.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "playwright",
+    "web-scraper",
+    "use-ai",
+    "chatbot",
+    "automation"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "express-rate-limit": "^7.1.5",
+    "playwright": "^1.61.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.2"
+  }
+}
