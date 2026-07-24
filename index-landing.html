@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InfoThink - AI Chat Scraper</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #1e3a5f 0%, #2c5aa0 50%, #1a4d7a 100%);
+            min-height: 100vh;
+            overflow-x: hidden;
+            color: #333;
+        }
+
+        .container {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 60px;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-right: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px 0;
+            gap: 20px;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #00d4ff, #0099ff);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            font-weight: 800;
+            color: white;
+            box-shadow: 0 8px 24px rgba(0, 153, 255, 0.3);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .logo-icon:hover {
+            transform: scale(1.05);
+            box-shadow: 0 12px 32px rgba(0, 153, 255, 0.4);
+        }
+
+        .sidebar-icon {
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            color: rgba(255, 255, 255, 0.6);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border-radius: 10px;
+        }
+
+        .sidebar-icon:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+
+        /* Main Content */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 20px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Background decoration */
+        .bg-decoration {
+            position: absolute;
+            width: 500px;
+            height: 500px;
+            border-radius: 50%;
+            opacity: 0.1;
+            pointer-events: none;
+        }
+
+        .bg-deco-1 {
+            background: radial-gradient(circle, white, transparent);
+            bottom: -200px;
+            left: -100px;
+            animation: float 20s ease-in-out infinite;
+        }
+
+        .bg-deco-2 {
+            background: radial-gradient(circle, white, transparent);
+            top: -150px;
+            right: -100px;
+            animation: float 25s ease-in-out infinite reverse;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(30px); }
+        }
+
+        .content-wrapper {
+            max-width: 1200px;
+            width: 100%;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        /* Header */
+        .header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+            margin-bottom: 60px;
+        }
+
+        .brand {
+            font-size: 24px;
+            font-weight: 800;
+            color: white;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .brand-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #00d4ff, #0099ff);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 30px;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: rgba(255, 255, 255, 0.7);
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+
+        .nav-links a:hover {
+            color: white;
+        }
+
+        .btn-primary {
+            background: white;
+            color: #0099ff;
+            padding: 10px 24px;
+            border-radius: 8px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(0, 153, 255, 0.2);
+        }
+
+        /* Hero Title */
+        .hero-title {
+            font-size: 56px;
+            font-weight: 800;
+            color: white;
+            text-align: center;
+            margin-bottom: 40px;
+            line-height: 1.2;
+            max-width: 800px;
+            animation: slideDown 0.8s ease-out;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Search Box */
+        .search-container {
+            width: 100%;
+            max-width: 800px;
+            margin-bottom: 60px;
+            animation: slideUp 0.8s ease-out 0.2s both;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .search-box {
+            background: white;
+            border-radius: 16px;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .search-box:hover,
+        .search-box:focus-within {
+            box-shadow: 0 24px 80px rgba(0, 153, 255, 0.3);
+            transform: translateY(-2px);
+        }
+
+        .search-box input {
+            flex: 1;
+            border: none;
+            outline: none;
+            font-size: 16px;
+            font-family: inherit;
+            color: #333;
+        }
+
+        .search-box input::placeholder {
+            color: #999;
+        }
+
+        .model-select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 500;
+            color: #333;
+            background: white;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .model-select:hover {
+            border-color: #0099ff;
+            color: #0099ff;
+        }
+
+        .voice-btn {
+            width: 40px;
+            height: 40px;
+            background: transparent;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            color: #666;
+        }
+
+        .voice-btn:hover {
+            color: #0099ff;
+            transform: scale(1.1);
+        }
+
+        /* Tips Grid */
+        .tips-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+            width: 100%;
+            animation: slideUp 0.8s ease-out 0.4s both;
+        }
+
+        .tip-card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 16px;
+            padding: 28px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .tip-card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+            background: white;
+        }
+
+        .tip-label {
+            display: inline-flex;
+            gap: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #0099ff;
+            align-items: center;
+            width: fit-content;
+        }
+
+        .tip-label::before {
+            content: '📍';
+            font-size: 14px;
+        }
+
+        .tip-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #1a1a1a;
+            line-height: 1.4;
+        }
+
+        .tip-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: auto;
+        }
+
+        .explore-btn {
+            background: rgba(0, 153, 255, 0.1);
+            color: #0099ff;
+            border: 1px solid rgba(0, 153, 255, 0.3);
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .explore-btn:hover {
+            background: #0099ff;
+            color: white;
+            border-color: #0099ff;
+        }
+
+        .tip-icon {
+            font-size: 48px;
+            opacity: 0.8;
+            transition: all 0.3s ease;
+        }
+
+        .tip-card:hover .tip-icon {
+            transform: scale(1.1);
+            opacity: 1;
+        }
+
+        /* Footer */
+        footer {
+            position: absolute;
+            bottom: 20px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 13px;
+        }
+
+        footer a {
+            color: rgba(255, 255, 255, 0.8);
+            text-decoration: none;
+            transition: all 0.3s ease;
+        }
+
+        footer a:hover {
+            color: white;
+            text-decoration: underline;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .tips-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .hero-title {
+                font-size: 40px;
+            }
+
+            .nav-links {
+                gap: 15px;
+            }
+
+            .nav-links a {
+                font-size: 12px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                display: none;
+            }
+
+            .header-top {
+                margin-bottom: 40px;
+            }
+
+            .hero-title {
+                font-size: 32px;
+                margin-bottom: 24px;
+            }
+
+            .tips-grid {
+                gap: 16px;
+            }
+
+            .main {
+                padding: 20px 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="logo-icon" onclick="location.href='/'">💡</div>
+            <div class="sidebar-icon" title="Chat">💬</div>
+            <div class="sidebar-icon" title="Documents">📄</div>
+            <div class="sidebar-icon" title="Templates">✨</div>
+            <div class="sidebar-icon" title="History">🕐</div>
+            <div class="sidebar-icon" title="Team">👥</div>
+            <div style="flex: 1;"></div>
+            <div class="sidebar-icon" title="Settings">⚙️</div>
+            <div class="sidebar-icon" title="Help">❓</div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main">
+            <div class="bg-decoration bg-deco-1"></div>
+            <div class="bg-decoration bg-deco-2"></div>
+
+            <div class="content-wrapper">
+                <!-- Header -->
+                <div class="header-top">
+                    <div class="brand">
+                        <div class="brand-icon">💡</div>
+                        InfoThink
+                    </div>
+                    <div class="nav-links">
+                        <a href="#features">Features</a>
+                        <a href="#pricing">Pricing</a>
+                        <a href="#docs">Docs</a>
+                        <button class="btn-primary" onclick="location.href='/app.html'">Start Chat</button>
+                    </div>
+                </div>
+
+                <!-- Hero Title -->
+                <h1 class="hero-title">What can I help you discover today?</h1>
+
+                <!-- Search Box -->
+                <div class="search-container">
+                    <div class="search-box">
+                        <input type="text" placeholder="Ask anything or @ mention a tab" id="searchInput" onkeydown="handleSearch(event)">
+                        <select class="model-select" id="modelSelect">
+                            <option value="Auto">Auto</option>
+                            <option value="Sonnet 5">Sonnet 5</option>
+                            <option value="Fable 5">Fable 5</option>
+                            <option value="GPT-5.6">GPT-5.6</option>
+                        </select>
+                        <button class="voice-btn" title="Voice Input">🎤</button>
+                    </div>
+                </div>
+
+                <!-- Tips Grid -->
+                <div class="tips-grid">
+                    <!-- Card 1 -->
+                    <div class="tip-card" onclick="location.href='/app.html?prompt=Explain%20quantum%20computing'">
+                        <div class="tip-label">Explore</div>
+                        <div class="tip-title">Learn complex topics from multiple AI sources</div>
+                        <div class="tip-footer">
+                            <button class="explore-btn" onclick="event.stopPropagation(); location.href='/app.html'">Explore</button>
+                            <div class="tip-icon">🔬</div>
+                        </div>
+                    </div>
+
+                    <!-- Card 2 -->
+                    <div class="tip-card" onclick="location.href='/app.html?prompt=Compare%20different%20perspectives'">
+                        <div class="tip-label">Discover</div>
+                        <div class="tip-title">Compare multiple AI models in one place</div>
+                        <div class="tip-footer">
+                            <button class="explore-btn" onclick="event.stopPropagation(); location.href='/app.html'">Explore</button>
+                            <div class="tip-icon">⚖️</div>
+                        </div>
+                    </div>
+
+                    <!-- Card 3 -->
+                    <div class="tip-card" onclick="location.href='/app.html?prompt=Get%20sources%20and%20citations'">
+                        <div class="tip-label">Research</div>
+                        <div class="tip-title">Get verified sources and citations for every answer</div>
+                        <div class="tip-footer">
+                            <button class="explore-btn" onclick="event.stopPropagation(); location.href='/app.html'">Explore</button>
+                            <div class="tip-icon">📚</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <footer>
+                <p>© 2026 InfoThink. All rights reserved. | <a href="#privacy">Privacy</a> | <a href="#terms">Terms</a> | <a href="https://github.com/ismdfaruai-ctrl/infothink" target="_blank">GitHub</a></p>
+            </footer>
+        </div>
+    </div>
+
+    <script>
+        function handleSearch(event) {
+            if (event.key === 'Enter') {
+                const query = document.getElementById('searchInput').value.trim();
+                if (query) {
+                    const encodedQuery = encodeURIComponent(query);
+                    location.href = `/app.html?prompt=${encodedQuery}`;
+                }
+            }
+        }
+
+        // Preload search param if exists
+        window.addEventListener('load', () => {
+            const params = new URLSearchParams(window.location.search);
+            const prompt = params.get('prompt');
+            if (prompt) {
+                document.getElementById('searchInput').value = decodeURIComponent(prompt);
+            }
+        });
+    </script>
+</body>
+</html>
