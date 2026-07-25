@@ -1,25 +1,33 @@
 const path = require('path');
 const fs = require('fs');
 
-// Keep Playwright browsers in the project so restarts don't re-download Chromium.
-const BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH
-    || path.join(__dirname, '.playwright-browsers');
+// Prefer project-local Chromium so Cursor sandbox env overrides do not break launches.
+const LOCAL_BROWSERS_PATH = path.join(__dirname, '.playwright-browsers');
+const BROWSERS_PATH = fs.existsSync(path.join(LOCAL_BROWSERS_PATH, 'chromium-1228', 'chrome-win64', 'chrome.exe'))
+    ? LOCAL_BROWSERS_PATH
+    : (process.env.PLAYWRIGHT_BROWSERS_PATH || LOCAL_BROWSERS_PATH);
 process.env.PLAYWRIGHT_BROWSERS_PATH = BROWSERS_PATH;
 
-function getChromiumExecutable() {
-    const direct = path.join(BROWSERS_PATH, 'chromium-1228', 'chrome-win64', 'chrome.exe');
+function findChromeIn(browsersPath) {
+    const direct = path.join(browsersPath, 'chromium-1228', 'chrome-win64', 'chrome.exe');
     if (fs.existsSync(direct)) return direct;
 
     try {
-        const entries = fs.readdirSync(BROWSERS_PATH, { withFileTypes: true });
+        const entries = fs.readdirSync(browsersPath, { withFileTypes: true });
         for (const entry of entries) {
             if (!entry.isDirectory() || !entry.name.startsWith('chromium-')) continue;
-            const candidate = path.join(BROWSERS_PATH, entry.name, 'chrome-win64', 'chrome.exe');
+            const candidate = path.join(browsersPath, entry.name, 'chrome-win64', 'chrome.exe');
             if (fs.existsSync(candidate)) return candidate;
         }
     } catch (e) {}
 
     return null;
+}
+
+function getChromiumExecutable() {
+    return findChromeIn(LOCAL_BROWSERS_PATH)
+        || findChromeIn(BROWSERS_PATH)
+        || findChromeIn(process.env.PLAYWRIGHT_BROWSERS_PATH || '');
 }
 
 const express = require('express');
