@@ -239,12 +239,27 @@ async function scrape(email, prompt, model, retryCount = 0) {
         addLog('✅ Loaded');
 
         addLog('\n🔐 STEP 2: Click Sign in');
-        await page.locator('button:has-text("Sign in")').click({ timeout: 5000, noWaitAfter: true });
+        // Desktop + mobile both have Sign in — use desktop header button only
+        const signIn = page.getByTestId('header-sign-in-button')
+            .or(page.locator('button:has-text("Sign in")').first());
+        await signIn.waitFor({ state: 'visible', timeout: 10000 });
+        await signIn.click({ timeout: 10000, noWaitAfter: true });
         addLog('✅ Sign In clicked');
+        await shot(page);
 
-        addLog('\n📧 STEP 3: Click Continue with email (immediately after)');
-        await page.locator('button:has-text("Continue with email")').click({ timeout: 5000, noWaitAfter: true });
-        await page.waitForSelector('input[type="email"]', { timeout: 5000 });
+        addLog('\n📧 STEP 3: Wait for Continue with email, then click');
+        const continueWithEmail = page.getByRole('button', { name: /continue with email/i })
+            .or(page.locator('button').filter({ hasText: /continue with email/i }));
+        try {
+            await continueWithEmail.first().waitFor({ state: 'visible', timeout: 15000 });
+        } catch (e) {
+            // Sign-in click may not have opened modal — retry once
+            addLog('⚠️ Auth modal not visible yet — clicking Sign in again');
+            await signIn.click({ timeout: 5000, noWaitAfter: true });
+            await continueWithEmail.first().waitFor({ state: 'visible', timeout: 15000 });
+        }
+        await continueWithEmail.first().click({ timeout: 10000, noWaitAfter: true });
+        await page.waitForSelector('input[type="email"]', { timeout: 10000 });
         await shot(page);
         addLog('✅ Continue with email clicked');
 
