@@ -4,6 +4,9 @@
   "description": "Scrape use.ai responses and integrate with React chat app",
   "main": "backend-api.ts",
   "scripts": {
+    "backend": "node backend-server.js",
+    "frontend": "node frontend-server.js",
+    "playwright:install": "node -e \"const p=require('path');const cp=require('child_process');process.env.PLAYWRIGHT_BROWSERS_PATH=p.join(process.cwd(),'.playwright-browsers');cp.execSync('npx playwright install chromium',{stdio:'inherit',env:process.env})\"",
     "dev": "ts-node-dev --respawn --transpile-only backend-api.ts",
     "build": "tsc",
     "start": "node dist/backend-api.js",

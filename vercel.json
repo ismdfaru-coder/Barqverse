@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "name": "use-ai-scraper-ui",
+  "rewrites": [
+    { "source": "/app", "destination": "/app.html" },
+    { "source": "/dashboard", "destination": "/dashboard.html" },
+    { "source": "/", "destination": "/dashboard.html" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" }
+      ]
+    }
+  ]
+}

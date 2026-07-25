@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Use.ai Scraper - Debug Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Monaco, Menlo, Ubuntu Mono, monospace; background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%); color: #e0e0e0; }
+    .header { background: linear-gradient(90deg, #00ff88 0%, #00ccff 100%); padding: 20px; color: #000; border-bottom: 3px solid #00ff88; }
+    .header-links { margin-top: 8px; font-size: 13px; }
+    .header-links a { color: #003322; margin-right: 16px; }
+    .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 20px; max-width: 1600px; margin: 0 auto; }
+    .panel { background: #1a1f3a; border: 2px solid #00ff88; border-radius: 8px; padding: 20px; }
+    .panel h2 { color: #00ff88; margin-bottom: 15px; font-size: 16px; }
+    .status-banner { display: flex; justify-content: space-between; align-items: center; background: #0a0e27; padding: 10px; margin-bottom: 15px; border-radius: 4px; border: 1px solid #00ccff; }
+    .status-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
+    .status-dot.connected { background: #00ff88; }
+    .status-dot.disconnected { background: #ff4444; }
+    input, textarea, select { width: 100%; padding: 10px; margin-bottom: 12px; background: #0a0e27; border: 1px solid #00ccff; color: #e0e0e0; border-radius: 4px; font-family: Monaco, monospace; font-size: 12px; }
+    input:focus, textarea:focus, select:focus { outline: none; border-color: #00ff88; box-shadow: 0 0 12px rgba(0, 255, 136, 0.4); }
+    .button-group { display: flex; gap: 10px; }
+    button { flex: 1; padding: 12px; background: #00ff88; color: #000; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+    button:hover:not(:disabled) { box-shadow: 0 6px 12px rgba(0, 255, 136, 0.4); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .output-box, .logs-box { background: #0a0e27; border: 1px solid #00ccff; padding: 12px; border-radius: 4px; height: 300px; overflow-y: auto; font-size: 11px; color: #00ff88; white-space: pre-wrap; }
+    .logs-box { height: 400px; }
+    .log-line { margin-bottom: 2px; padding: 2px 4px; }
+    .log-time { color: #666; margin-right: 8px; }
+    .log-info { color: #00ccff; }
+    .log-success { color: #00ff88; }
+    .log-error { color: #ff6666; }
+    .full-width { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Debug Dashboard</h1>
+    <div class="header-links">
+      Backend: <a href="http://localhost:5000/debug" target="_blank">http://localhost:5000/debug</a>
+      | Chat UI: <a href="/app">http://localhost:3000/app</a>
+    </div>
+  </div>
+  <div class="container">
+    <div class="panel">
+      <h2>Server Status</h2>
+      <div class="status-banner">
+        <div><span class="status-dot disconnected" id="backend-status"></span>Backend Server</div>
+        <div id="backend-status-text">Checking...</div>
+      </div>
+      <div class="status-banner">
+        <div><span class="status-dot connected"></span>Frontend Console</div>
+        <div>Connected</div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Scraper Control</h2>
+      <form id="scrapeForm">
+        <input type="email" id="email" placeholder="Email address (required)" required>
+        <textarea id="prompt" placeholder="Enter prompt..." rows="4" required></textarea>
+        <select id="model">
+          <option selected>Auto</option>
+          <option>Fable 5</option>
+          <option>Sonnet 5</option>
+          <option>Claude 3.5</option>
+        </select>
+        <div class="button-group">
+          <button type="submit" id="scrapeBtn">Scrape</button>
+          <button type="button" id="modelsBtn">Get Models</button>
+        </div>
+      </form>
+    </div>
+    <div class="panel">
+      <h2>Response</h2>
+      <div class="output-box" id="responseBox">Waiting for response...</div>
+    </div>
+    <div class="panel">
+      <h2>Details</h2>
+      <div class="output-box" id="detailsBox">Details will appear here...</div>
+    </div>
+    <div class="panel full-width">
+      <h2>Debug Logs</h2>
+      <div class="logs-box" id="logsBox"></div>
+    </div>
+  </div>
+  <script>
+    const API_URL = 'http://localhost:5000';
+
+    function addLog(msg, type = 'info') {
+      const t = new Date().toLocaleTimeString();
+      const line = document.createElement('div');
+      line.className = 'log-line';
+      line.innerHTML = '<span class="log-time">[' + t + ']</span><span class="log-' + type + '">' + msg + '</span>';
+      document.getElementById('logsBox').appendChild(line);
+      document.getElementById('logsBox').scrollTop = document.getElementById('logsBox').scrollHeight;
+    }
+
+    async function parseJsonResponse(res) {
+      const text = await res.text();
+      try {
+        return { ok: res.ok, status: res.status, data: JSON.parse(text), raw: text };
+      } catch {
+        return { ok: false, status: res.status, data: null, raw: text };
+      }
+    }
+
+    async function checkBackendHealth() {
+      try {
+        const res = await fetch(API_URL + '/api/health');
+        const parsed = await parseJsonResponse(res);
+        if (parsed.ok && parsed.data && parsed.data.status === 'ok') {
+          document.getElementById('backend-status').className = 'status-dot connected';
+          document.getElementById('backend-status-text').textContent = 'Connected';
+          return;
+        }
+        throw new Error(parsed.raw || 'Health check failed');
+      } catch (err) {
+        document.getElementById('backend-status').className = 'status-dot disconnected';
+        document.getElementById('backend-status-text').textContent = 'Disconnected';
+      }
+    }
+
+    setInterval(checkBackendHealth, 10000);
+    checkBackendHealth();
+
+    document.getElementById('scrapeForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('email').value;
+      const prompt = document.getElementById('prompt').value;
+      const model = document.getElementById('model').value;
+      const scrapeBtn = document.getElementById('scrapeBtn');
+
+      scrapeBtn.disabled = true;
+      addLog('Sending request...', 'info');
+      addLog('Email: ' + email, 'info');
+      addLog('Model: ' + model, 'info');
+      document.getElementById('responseBox').textContent = 'Scraping use.ai (may take 30-60 seconds)...';
+
+      try {
+        const res = await fetch(API_URL + '/api/scrape', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt, email, model })
+        });
+        const parsed = await parseJsonResponse(res);
+
+        document.getElementById('detailsBox').textContent = JSON.stringify({
+          status: parsed.status,
+          timestamp: new Date().toISOString(),
+          response: parsed.data || parsed.raw
+        }, null, 2);
+
+        if (!parsed.data) {
+          throw new Error(parsed.raw || 'Server returned non-JSON response');
+        }
+
+        if (parsed.data.success) {
+          document.getElementById('responseBox').textContent = parsed.data.data.response;
+          addLog('Success! ' + parsed.data.data.response.length + ' chars', 'success');
+        } else {
+          addLog('Error: ' + (parsed.data.error || 'Unknown error'), 'error');
+          document.getElementById('responseBox').textContent = parsed.data.error || 'Scrape failed';
+        }
+      } catch (err) {
+        addLog('Failed: ' + err.message, 'error');
+        document.getElementById('responseBox').textContent = 'Error: ' + err.message;
+      } finally {
+        scrapeBtn.disabled = false;
+      }
+    });
+
+    document.getElementById('modelsBtn').addEventListener('click', async () => {
+      try {
+        const res = await fetch(API_URL + '/api/models');
+        const parsed = await parseJsonResponse(res);
+        if (!parsed.data) throw new Error(parsed.raw || 'Invalid response');
+        addLog('Models: ' + parsed.data.models.join(', '), 'success');
+      } catch (err) {
+        addLog('Failed: ' + err.message, 'error');
+      }
+    });
+
+    addLog('Dashboard ready', 'success');
+  </script>
+</body>
+</html>

@@ -1,3 +1,27 @@
+const path = require('path');
+const fs = require('fs');
+
+// Keep Playwright browsers in the project so restarts don't re-download Chromium.
+const BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH
+    || path.join(__dirname, '.playwright-browsers');
+process.env.PLAYWRIGHT_BROWSERS_PATH = BROWSERS_PATH;
+
+function getChromiumExecutable() {
+    const direct = path.join(BROWSERS_PATH, 'chromium-1228', 'chrome-win64', 'chrome.exe');
+    if (fs.existsSync(direct)) return direct;
+
+    try {
+        const entries = fs.readdirSync(BROWSERS_PATH, { withFileTypes: true });
+        for (const entry of entries) {
+            if (!entry.isDirectory() || !entry.name.startsWith('chromium-')) continue;
+            const candidate = path.join(BROWSERS_PATH, entry.name, 'chrome-win64', 'chrome.exe');
+            if (fs.existsSync(candidate)) return candidate;
+        }
+    } catch (e) {}
+
+    return null;
+}
+
 const express = require('express');
 const cors = require('cors');
 const { chromium } = require('playwright');
@@ -20,12 +44,172 @@ function addLog(msg) {
 }
 
 async function initBrowser() {
-    browser = await chromium.launch({ headless: false });
+    let executablePath = getChromiumExecutable();
+    if (!executablePath) {
+        try {
+            const fromPlaywright = chromium.executablePath();
+            if (fromPlaywright && fs.existsSync(fromPlaywright)) {
+                executablePath = fromPlaywright;
+            }
+        } catch (e) {}
+    }
+    if (!executablePath) {
+        throw new Error(
+            'Chromium not found. From project folder run: npm run playwright:install'
+        );
+    }
+
+    browser = await chromium.launch({
+        headless: false,
+        executablePath,
+        args: ['--disable-background-networking', '--disable-extensions', '--disable-sync']
+    });
     addLog('✅ Browser ready');
 }
 
+async function clickEmailContinue(page) {
+    const emailInput = page.locator('input[type="email"]').first();
+    await emailInput.waitFor({ state: 'visible', timeout: 5000 });
+    await emailInput.click();
+
+    const candidates = [
+        page.locator('form:has(input[type="email"]) button').filter({ hasText: /^Continue$/i }).last(),
+        page.locator('[role="dialog"] button').filter({ hasText: /^Continue$/i }).last(),
+        page.locator('button').filter({ hasText: /^Continue$/i }).last()
+    ];
+
+    for (const btn of candidates) {
+        if (await btn.count() === 0) continue;
+        try {
+            await btn.waitFor({ state: 'visible', timeout: 3000 });
+            await btn.scrollIntoViewIfNeeded();
+            await btn.click({ timeout: 5000, force: true, noWaitAfter: true });
+            return 'button';
+        } catch (e) {
+            continue;
+        }
+    }
+
+    await emailInput.focus();
+    await emailInput.press('Enter', { noWaitAfter: true });
+    return 'enter';
+}
+
+async function waitForAccountCreated(page, timeoutMs = 20000) {
+    await page.waitForFunction(
+        () => /Account created successfully/i.test(document.body.innerText),
+        { timeout: timeoutMs }
+    );
+}
+
+const MODEL_NAMES = ['Auto', 'Fable 5', 'Sonnet 5', 'Claude 3.5', 'GPT-5.6 Terra', 'Gemini 3.1 Pro'];
+
+async function findModelDropdown(page) {
+    await page.waitForSelector('textarea, [role="textbox"]', { timeout: 15000 });
+
+    const chatInput = page.locator('textarea, [role="textbox"]').first();
+    const chatArea = chatInput.locator('xpath=ancestor::*[self::form or self::div][position()<=6]').last();
+
+    for (const name of MODEL_NAMES) {
+        const inChat = chatArea.locator('button').filter({ hasText: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }).first();
+        if (await inChat.count() > 0 && await inChat.isVisible({ timeout: 500 }).catch(() => false)) {
+            return inChat;
+        }
+    }
+
+    for (const name of MODEL_NAMES) {
+        const btn = page.locator('button').filter({ hasText: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }).first();
+        if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+            return btn;
+        }
+    }
+
+    const ariaDropdown = page.locator('button[aria-haspopup="listbox"], button[aria-haspopup="menu"], [role="combobox"]').first();
+    if (await ariaDropdown.isVisible({ timeout: 1000 }).catch(() => false)) {
+        return ariaDropdown;
+    }
+
+    return page.locator('button:has-text("Auto")').first();
+}
+
+async function selectChatModel(page, model) {
+    const targetModel = (model || 'Auto').trim();
+    addLog(`\n🤖 STEP 10: Open chat model dropdown and select "${targetModel}"`);
+
+    const dropdownBtn = await findModelDropdown(page);
+    await dropdownBtn.waitFor({ state: 'visible', timeout: 8000 });
+    await dropdownBtn.scrollIntoViewIfNeeded();
+
+    const currentLabel = (await dropdownBtn.textContent().catch(() => '')).trim();
+    addLog(`📍 Current model button: "${currentLabel || 'unknown'}"`);
+
+    if (currentLabel.toLowerCase() === targetModel.toLowerCase()) {
+        addLog(`✅ Already on ${targetModel}`);
+        await shot(page);
+        return targetModel;
+    }
+
+    await dropdownBtn.click({ timeout: 5000, noWaitAfter: true });
+    await shot(page);
+    addLog('✅ Opened model dropdown');
+
+    const escaped = targetModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const optionLocators = [
+        page.locator('[role="menuitem"]').filter({ hasText: new RegExp(`^${escaped}$`, 'i') }),
+        page.locator('[role="option"]').filter({ hasText: new RegExp(`^${escaped}$`, 'i') }),
+        page.locator('[role="listbox"] button, [role="menu"] button, [role="listbox"] [role="option"], [role="menu"] [role="menuitem"]')
+            .filter({ hasText: new RegExp(`^${escaped}$`, 'i') }),
+        page.locator('li, div, span, button').filter({ hasText: new RegExp(`^${escaped}$`, 'i') })
+    ];
+
+    let selected = false;
+    for (const options of optionLocators) {
+        const count = await options.count();
+        for (let i = 0; i < count; i++) {
+            const opt = options.nth(i);
+            try {
+                await opt.waitFor({ state: 'visible', timeout: 2000 });
+                await opt.scrollIntoViewIfNeeded();
+                await opt.click({ timeout: 3000, noWaitAfter: true });
+                selected = true;
+                addLog(`✅ Clicked option: ${targetModel}`);
+                break;
+            } catch (e) {
+                continue;
+            }
+        }
+        if (selected) break;
+    }
+
+    if (!selected) {
+        throw new Error(`Could not find model option "${targetModel}" in dropdown`);
+    }
+
+    await shot(page);
+
+    const verified = await page.evaluate((wanted) => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        for (const btn of buttons) {
+            const text = btn.textContent?.trim() || '';
+            if (text.toLowerCase() === wanted.toLowerCase()) {
+                const rect = btn.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return text;
+            }
+        }
+        return null;
+    }, targetModel);
+
+    if (verified) {
+        addLog(`✅ Verified model selected: ${verified}`);
+        return verified;
+    }
+
+    addLog(`⚠️ Could not verify "${targetModel}" on button, continuing anyway`);
+    return targetModel;
+}
+
 async function shot(page) {
-    try { lastScreenshot = await page.screenshot({ type: 'png' }); } catch(e) {}
+    try { lastScreenshot = await page.screenshot({ type: 'png' }); } catch (e) {}
 }
 
 async function scrape(email, prompt, model, retryCount = 0) {
@@ -37,44 +221,75 @@ async function scrape(email, prompt, model, retryCount = 0) {
 
     const ctx = await browser.newContext();
     const page = await ctx.newPage();
+    page.setDefaultTimeout(8000);
+    page.setDefaultNavigationTimeout(15000);
 
     try {
         addLog('\n📍 STEP 1: Navigate to use.ai');
-        await page.goto('https://use.ai', { waitUntil: 'load', timeout: 20000 });
+        await page.goto('https://use.ai', { waitUntil: 'domcontentloaded', timeout: 15000 });
         await shot(page);
         addLog('✅ Loaded');
 
         addLog('\n🔐 STEP 2: Click Sign in');
-        await page.waitForSelector('button:has-text("Sign in")', { timeout: 5000 });
-        await page.click('button:has-text("Sign in")');
+        await page.locator('button:has-text("Sign in")').click({ timeout: 5000, noWaitAfter: true });
         addLog('✅ Sign In clicked');
 
         addLog('\n📧 STEP 3: Click Continue with email (immediately after)');
-        await page.waitForSelector('button:has-text("Continue with email")', { timeout: 5000 });
-        await page.click('button:has-text("Continue with email")');
-        await page.waitForTimeout(300);
+        await page.locator('button:has-text("Continue with email")').click({ timeout: 5000, noWaitAfter: true });
+        await page.waitForSelector('input[type="email"]', { timeout: 5000 });
         await shot(page);
         addLog('✅ Continue with email clicked');
 
         addLog('\n✉️ STEP 4: Enter email');
-        await page.waitForSelector('input[type="email"]', { timeout: 5000 });
-        await page.fill('input[type="email"]', email);
-        await page.waitForTimeout(300);
+        await page.fill('input[type="email"]', email, { timeout: 5000 });
         await shot(page);
         addLog(`✅ Email: ${email}`);
 
-        addLog('\n👆 STEP 5: Click ONLY "Continue" button (bottom)');
-        // Wait for Continue button to be visible and clickable
-        const continueBtn = page.locator('button:has-text("Continue")').last();
-        await continueBtn.waitFor({ state: 'visible', timeout: 5000 });
-        await continueBtn.click();
-        addLog('✅ Continue button clicked');
+        addLog('\n👆 STEP 5: Click Continue button below email');
+        const clickMethod = await clickEmailContinue(page);
+        await shot(page);
+        addLog(`✅ Continue clicked (${clickMethod})`);
 
-        // Immediately try to bypass paywall by navigating with paywall flag
+        addLog('\n⏳ STEP 6: Wait for "Account created successfully"');
         try {
-            addLog('\n🔁 Attempting paywall bypass via query param');
-            await page.goto('https://use.ai/?paywall=false', { waitUntil: 'networkidle', timeout: 5000 }).catch(() => null);
-            await page.waitForTimeout(500);
+            await waitForAccountCreated(page, 20000);
+            await shot(page);
+            addLog('✅ Account created successfully');
+        } catch (e) {
+            const pageText = await page.evaluate(() => document.body.innerText);
+            if (/Account created successfully/i.test(pageText)) {
+                addLog('✅ Account created successfully (already visible)');
+            } else if (pageText.includes('Check your email')) {
+                addLog('⚠️ "Check your email" detected before account creation! Retrying...');
+                await ctx.close();
+                const maxRetries = 10;
+                if (retryCount < maxRetries) {
+                    const makeRetryEmail = (origEmail) => {
+                        try {
+                            const parts = origEmail.split('@');
+                            const local = parts[0];
+                            const domain = parts[1] || '';
+                            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+                            const rand = chars[Math.floor(Math.random() * chars.length)];
+                            return `${local}.${rand}${retryCount}@${domain}`;
+                        } catch (err) {
+                            return origEmail;
+                        }
+                    };
+                    const newEmail = makeRetryEmail(email);
+                    addLog(`🔁 Retrying with email: ${newEmail}`);
+                    return await scrape(newEmail, prompt, model, retryCount + 1);
+                }
+                throw new Error('Max retries exceeded: Check your email keeps appearing');
+            } else {
+                addLog(`⚠️ Success message not detected yet: ${e.message}`);
+                await shot(page);
+            }
+        }
+
+        addLog('\n🔁 STEP 7: Attempting paywall bypass via query param');
+        try {
+            await page.goto('https://use.ai/?paywall=false', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => null);
             await shot(page);
             const body = await page.evaluate(() => document.body.innerText);
             if (/Upgrade to PRO|Upgrade|Go Pro|pricing|payment/i.test(body)) {
@@ -86,18 +301,15 @@ async function scrape(email, prompt, model, retryCount = 0) {
             addLog(`⚠️ Error during paywall bypass navigation: ${e.message}`);
         }
 
-        addLog('\n⏳ STEP 6: Check for "Check your email" (immediate check)');
-        await page.waitForTimeout(300);
+        addLog('\n⏳ STEP 8: Check for "Check your email" after bypass');
         await shot(page);
-        
-        // Check if "Check your email" message appears - immediate check, no long wait
-        const pageText = await page.evaluate(() => document.body.innerText);
-        if (pageText.includes('Check your email')) {
-            addLog('⚠️ "Check your email" detected! Retrying immediately...');
+
+        const pageTextAfterBypass = await page.evaluate(() => document.body.innerText);
+        if (pageTextAfterBypass.includes('Check your email')) {
+            addLog('⚠️ "Check your email" detected after bypass! Retrying...');
             await ctx.close();
             const maxRetries = 10;
             if (retryCount < maxRetries) {
-                // Generate a slightly different email for retry: insert a random char before the @
                 const makeRetryEmail = (origEmail) => {
                     try {
                         const parts = origEmail.split('@');
@@ -105,23 +317,20 @@ async function scrape(email, prompt, model, retryCount = 0) {
                         const domain = parts[1] || '';
                         const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
                         const rand = chars[Math.floor(Math.random() * chars.length)];
-                        // Ensure variation by appending '.' + rand + retryCount
                         return `${local}.${rand}${retryCount}@${domain}`;
-                    } catch (e) {
+                    } catch (err) {
                         return origEmail;
                     }
                 };
                 const newEmail = makeRetryEmail(email);
                 addLog(`🔁 Retrying with email: ${newEmail}`);
                 return await scrape(newEmail, prompt, model, retryCount + 1);
-            } else {
-                addLog(`❌ Max retries (${maxRetries}) reached. Giving up.`);
-                throw new Error('Max retries exceeded: Check your email keeps appearing');
             }
+            throw new Error('Max retries exceeded: Check your email keeps appearing');
         }
         addLog('✅ No email verification check');
 
-        addLog('\n🎯 STEP 7: Close popup if exists (enhanced)');
+        addLog('\n🎯 STEP 9: Close popup if exists (enhanced)');
         try {
             // More aggressive popup detection and closing
             const allButtons = await page.locator('button').all();
@@ -136,8 +345,7 @@ async function scrape(email, prompt, model, retryCount = 0) {
                     
                     if (isVisible && (txt.includes('Close') || txt.includes('×') || txt.includes('✕') ||
                         ariaLabel?.includes('close') || title?.includes('Close'))) {
-                        await btn.click();
-                        await page.waitForTimeout(500);
+                        await btn.click({ noWaitAfter: true });
                         popupClicked = true;
                         addLog(`✅ Popup closed via button`);
                         break;
@@ -146,9 +354,7 @@ async function scrape(email, prompt, model, retryCount = 0) {
             }
             
             if (!popupClicked) {
-                // Try pressing Escape
-                await page.keyboard.press('Escape');
-                await page.waitForTimeout(300);
+                await page.keyboard.press('Escape', { noWaitAfter: true });
                 popupClicked = true;
                 addLog('✅ Sent Escape to close popup');
             }
@@ -156,28 +362,19 @@ async function scrape(email, prompt, model, retryCount = 0) {
             await shot(page);
         } catch(e) { addLog(`⚠️ Error closing popup: ${e.message}`); }
 
-        addLog(`\n🤖 STEP 8: Select model (${model})`);
-        if (model && model !== 'Auto') {
-            try {
-                const mbtn = await page.locator('button:has-text("Auto")').first();
-                if (await mbtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-                    await mbtn.click();
-                    await page.waitForTimeout(300);
-                    const mopt = await page.locator(`text="${model}"`).first();
-                    if (await mopt.isVisible({ timeout: 1500 }).catch(() => false)) {
-                        await mopt.click();
-                        await page.waitForTimeout(300);
-                        await shot(page);
-                        addLog(`✅ Selected: ${model}`);
-                    } else addLog(`⚠️ Model not found`);
-                } else addLog('⚠️ Selector not found');
-            } catch(e) { addLog(`⚠️ Error: ${e.message}`); }
-        } else addLog('✅ Using Auto');
+        addLog(`\n🤖 STEP 10: Select model (${model})`);
+        try {
+            await selectChatModel(page, model || 'Auto');
+        } catch (e) {
+            addLog(`⚠️ Model selection error: ${e.message}`);
+            await shot(page);
+            throw new Error(`Failed to select model "${model}": ${e.message}`);
+        }
 
-        addLog('\n💬 STEP 9: Chat interface ready');
+        addLog('\n💬 STEP 11: Chat interface ready');
         addLog('✅ Ready');
 
-        addLog('\n📝 STEP 10: Fill prompt input');
+        addLog('\n📝 STEP 12: Fill prompt input');
         const sels = ['textarea[placeholder*="message" i]', 'textarea[placeholder*="prompt" i]', 'input[placeholder*="message" i]', 'textarea', 'input[type="text"]'];
         let inp = null;
         for (const sel of sels) {
@@ -191,13 +388,12 @@ async function scrape(email, prompt, model, retryCount = 0) {
             } catch(e) {}
         }
         if (!inp) { await shot(page); throw new Error('Input not found'); }
-        await inp.click();
-        await page.waitForTimeout(200);
+        await inp.click({ noWaitAfter: true });
         await inp.fill(prompt);
         await shot(page);
         addLog(`✅ Filled`);
 
-        addLog('\n🚀 STEP 11: Send (Enter)');
+        addLog('\n🚀 STEP 13: Send (Enter)');
         await inp.press('Enter');
         await shot(page);
         addLog('✅ Sent - monitoring for response completion');
@@ -242,16 +438,16 @@ async function scrape(email, prompt, model, retryCount = 0) {
             addLog(`⚠️ Error: ${e.message}`);
         }
 
-        // STEP 12: Extract sources from right panel
+        // STEP 14: Extract sources from right panel
         let sources = [];
-        addLog('\n📚 STEP 12: Extracting sources from right panel');
+        addLog('\n📚 STEP 14: Extracting sources from right panel');
         try {
             // Look for sources button/indicator in right panel (N Sources)
             const sourcesBtn = await page.locator('button:has-text("Source"), [aria-label*="source" i]').first();
             if (sourcesBtn) {
                 addLog('📍 Found sources button - clicking...');
-                await sourcesBtn.click();
-                await page.waitForTimeout(1000);
+                await sourcesBtn.click({ noWaitAfter: true });
+                await page.waitForSelector('a[href*="http"]', { timeout: 5000 }).catch(() => null);
                 addLog('✅ Sources panel opened');
 
                 // Scroll to bottom of sources panel to load all sources
@@ -259,13 +455,12 @@ async function scrape(email, prompt, model, retryCount = 0) {
                     const panel = document.querySelector('[class*="source"], [aria-label*="source" i]')?.parentElement;
                     if (!panel) return 0;
                     
-                    let scrollTop = 0;
                     let previousHeight = 0;
                     let attempts = 0;
                     
                     while (attempts < 20) {
                         panel.scrollTop = panel.scrollHeight;
-                        await new Promise(r => setTimeout(r, 300));
+                        await new Promise(r => setTimeout(r, 150));
                         
                         if (panel.scrollHeight === previousHeight) break;
                         previousHeight = panel.scrollHeight;
@@ -276,7 +471,7 @@ async function scrape(email, prompt, model, retryCount = 0) {
                 });
                 
                 addLog(`📍 Total source elements found: ${totalSources}`);
-                await page.waitForTimeout(500);
+                await page.waitForTimeout(300);
                 await shot(page);
 
                 // Extract all URLs from sources panel
@@ -369,6 +564,14 @@ app.get('/debug/screenshot', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+
+app.get('/api/models', (req, res) => {
+    res.json({
+        success: true,
+        models: ['Auto', 'Fable 5', 'Sonnet 5', 'Claude 3.5'],
+        timestamp: new Date().toISOString()
+    });
+});
 
 app.post('/api/scrape', async (req, res) => {
     const { prompt, model, email } = req.body;
