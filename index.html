@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>use.ai Scraper - Chat App</title>
+    <title>AutoBrowser Scraper - Chat App</title>
     <style>
         * {
             margin: 0;
@@ -381,22 +381,21 @@
         <!-- Login Screen -->
         <div id="loginScreen" class="login-screen" style="display: flex;">
             <div class="login-box">
-                <h2>🤖 use.ai Scraper</h2>
-                <p>Connect your email to get responses from use.ai</p>
+                <h2>🤖 AutoBrowser Scraper</h2>
+                <p>Connect your email to get responses from AutoBrowser</p>
                 <div class="form-group">
                     <label for="emailInput">Email Address:</label>
                     <input 
                         type="email" 
                         id="emailInput" 
                         placeholder="user@gmail.com"
-                        value="demo@gmail.com"
                     >
                 </div>
                 <button class="sign-in-btn" id="signInBtn" onclick="handleSignIn()">
                     Sign In
                 </button>
                 <p style="margin-top: 20px; color: #999; font-size: 12px;">
-                    ✅ Your email is never stored. Demo uses: demo@gmail.com
+                    ✅ Your email is never stored. A random demo address is pre-filled for you.
                 </p>
             </div>
         </div>
@@ -406,7 +405,7 @@
             <!-- Header -->
             <div class="header">
                 <div>
-                    <h1>← use.ai Scraper Chat</h1>
+                    <h1>← AutoBrowser Scraper Chat</h1>
                     <div class="info" id="userEmail"></div>
                 </div>
                 <button class="logout-btn" onclick="handleLogout()">Logout</button>
@@ -452,8 +451,8 @@
         const demoResponses = {
             "what is ai": "AI (Artificial Intelligence) is a technology that enables computers to perform tasks that typically require human intelligence. This includes understanding language, recognizing images, making decisions, and solving problems. Machine learning is the main subset behind modern AI, where algorithms learn from data to improve performance.",
             "what is machine learning": "Machine learning is a subset of artificial intelligence that focuses on enabling computers to learn from data without being explicitly programmed. Instead of following predetermined instructions, machine learning algorithms analyze patterns in data and improve their performance through experience.",
-            "hello": "Hello! 👋 I'm here to help you get responses from use.ai. Try asking me something like 'What is AI?' or 'Explain quantum computing'.",
-            "default": "That's an interesting question! In a production environment, this would be sent to use.ai, the AI would process it, and I'd return the response. For now, this is a demo mode to show you how the interface works."
+            "hello": "Hello! 👋 I'm here to help you get responses from AutoBrowser. Try asking me something like 'What is AI?' or 'Explain quantum computing'.",
+            "default": "That's an interesting question! In a production environment, this would be sent to AutoBrowser, the AI would process it, and I'd return the response. For now, this is a demo mode to show you how the interface works."
         };
 
         // Global state
@@ -462,15 +461,23 @@
         let isLoading = false;
         let messages = [];
 
+        const RANDOM_NAMES = ['david', 'john', 'sarah', 'mike', 'emma', 'alex', 'chris', 'olivia', 'james', 'sophia', 'liam', 'ava'];
+
+        function generateRandomEmail() {
+            const name = RANDOM_NAMES[Math.floor(Math.random() * RANDOM_NAMES.length)];
+            return `${name}@gmail.com`;
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('emailInput').value = generateRandomEmail();
             addWelcomeMessage();
         });
 
         function addWelcomeMessage() {
             addMessage(
                 '🤖',
-                'Welcome to use.ai Scraper! 👋\n\nType a prompt and I\'ll fetch the response from use.ai for you. Try asking "What is AI?" or any other question!',
+                'Welcome to AutoBrowser Scraper! 👋\n\nType a prompt and I\'ll fetch the response from AutoBrowser for you. Try asking "What is AI?" or any other question!',
                 'assistant'
             );
         }
@@ -516,7 +523,7 @@
             messages = [];
             document.getElementById('loginScreen').style.display = 'flex';
             document.getElementById('chatScreen').style.display = 'none';
-            document.getElementById('emailInput').value = 'demo@gmail.com';
+            document.getElementById('emailInput').value = generateRandomEmail();
             document.getElementById('promptInput').value = '';
             document.getElementById('messagesContainer').innerHTML = '';
         }

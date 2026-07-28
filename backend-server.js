@@ -1,6 +1,11 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
+const { PDFDocument, PDFName, rgb, StandardFonts } = require('pdf-lib');
+const sharp = require('sharp');
+const { createWorker } = require('tesseract.js');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], credentials: false }));
@@ -11,6 +16,9 @@ let browser = null;
 let lastScreenshot = null;
 let debugLogs = [];
 
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+
 function addLog(msg) {
     const time = new Date().toLocaleTimeString();
     const entry = `[${time}] ${msg}`;
@@ -19,13 +27,636 @@ function addLog(msg) {
     if (debugLogs.length > 150) debugLogs.shift();
 }
 
+// Reused across requests to avoid the ~1-2s OCR engine startup cost every time.
+let ocrWorker = null;
+async function getOcrWorker() {
+    if (!ocrWorker) {
+        addLog('🔤 Initializing OCR engine (first use may take a few seconds)...');
+        ocrWorker = await createWorker('eng', 1, { logger: () => {} });
+    }
+    return ocrWorker;
+}
+
+function extractJpegImages(pdfLibDoc) {
+    const images = [];
+    for (const [, obj] of pdfLibDoc.context.enumerateIndirectObjects()) {
+        if (obj && obj.dict && obj.dict.get) {
+            const subtype = obj.dict.get(PDFName.of('Subtype'));
+            if (subtype && subtype.toString() === '/Image') {
+                const filter = obj.dict.get(PDFName.of('Filter'));
+                if (filter && filter.toString() === '/DCTDecode' && obj.contents) {
+                    images.push(Buffer.from(obj.contents));
+                }
+            }
+        }
+    }
+    return images;
+}
+
+// Removes every visual occurrence of `findText` from a PDF (whiteout only, no
+// replacement text drawn - simplest and most reliable per user preference).
+// Handles two cases:
+//  1. PDFs with a real text layer - fast path via pdfjs-dist + pdf-lib.
+//  2. PDFs that are actually rasterized screenshots with NO text layer at all
+//     (this is what use.ai's "Download chat" export produces) - OCR (tesseract.js)
+//     locates the text directly on each page's embedded image and it gets painted
+//     over with white in the image pixels themselves.
+async function redactTextFromPdf(filePath, findText) {
+    const bytes = fs.readFileSync(filePath);
+    const findLower = findText.toLowerCase();
+
+    // --- Fast path: real text layer ---
+    try {
+        const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        const pdfjsDoc = await pdfjsLib.getDocument({ data: new Uint8Array(bytes) }).promise;
+        const pdfLibDoc = await PDFDocument.load(bytes);
+
+        let totalTextItems = 0;
+        let textMatches = 0;
+
+        for (let pageNum = 1; pageNum <= pdfjsDoc.numPages; pageNum++) {
+            const page = await pdfjsDoc.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            totalTextItems += textContent.items.length;
+            const pdfLibPage = pdfLibDoc.getPage(pageNum - 1);
+
+            for (const item of textContent.items) {
+                if (!item.str || !item.str.toLowerCase().includes(findLower)) continue;
+                const tx = item.transform;
+                const fontSize = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 10;
+                const itemWidth = item.width || (item.str.length * fontSize * 0.5);
+                const itemHeight = item.height || fontSize;
+                pdfLibPage.drawRectangle({
+                    x: tx[4] - 2, y: tx[5] - 3,
+                    width: itemWidth + 4, height: itemHeight + 6,
+                    color: rgb(1, 1, 1),
+                });
+                textMatches++;
+            }
+        }
+
+        if (textMatches > 0) {
+            fs.writeFileSync(filePath, await pdfLibDoc.save());
+            return { method: 'text', count: textMatches };
+        }
+        if (totalTextItems > 0) {
+            return { method: 'text', count: 0 }; // has real text, but no matches found
+        }
+        // totalTextItems === 0 => this PDF has no text layer at all, fall through to OCR
+    } catch (e) {
+        addLog(`⚠️ Text-layer redaction attempt failed: ${e.message}`);
+    }
+
+    // --- Fallback: rasterized/screenshot PDF - locate text via OCR on the images ---
+    const origDoc = await PDFDocument.load(bytes);
+    const jpegImages = extractJpegImages(origDoc);
+    const pages = origDoc.getPages();
+
+    if (!jpegImages.length) return { method: 'none', count: 0 };
+
+    const worker = await getOcrWorker();
+    const outDoc = await PDFDocument.create();
+    const matchRegex = new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    let imageMatches = 0;
+    // These chrome elements (top-left logo header, "Generated by use.ai" footer) are
+    // structural, not OCR-detectable content (the footer text is too low-contrast for
+    // reliable OCR), so they're always whited out on the first/last page respectively,
+    // sized proportionally to the image width so it still works if export resolution changes.
+    const HEADER_HEIGHT_RATIO = 90 / 1438;
+    const FOOTER_HEIGHT_RATIO = 110 / 1438;
+
+    for (let i = 0; i < pages.length; i++) {
+        const { width: pageW, height: pageH } = pages[i].getSize();
+        const imgBuffer = jpegImages[i];
+
+        if (!imgBuffer) {
+            outDoc.addPage([pageW, pageH]);
+            continue;
+        }
+
+        const { data } = await worker.recognize(imgBuffer, {}, { blocks: true });
+        const words = [];
+        (data.blocks || []).forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => (l.words || []).forEach(w => words.push(w)))));
+        const matches = words.filter(w => matchRegex.test(w.text));
+
+        const meta = await sharp(imgBuffer).metadata();
+        const rects = [];
+
+        const padSide = 6, padTop = 14, padBottom = 6;
+        matches.forEach(m => {
+            const x = Math.max(0, m.bbox.x0 - padSide);
+            const y = Math.max(0, m.bbox.y0 - padTop);
+            const w = Math.min(meta.width - x, (m.bbox.x1 - m.bbox.x0) + padSide * 2);
+            const h = Math.min(meta.height - y, (m.bbox.y1 - m.bbox.y0) + padTop + padBottom);
+            rects.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="white"/>`);
+        });
+        imageMatches += matches.length;
+
+        const isFirstPage = i === 0;
+        const isLastPage = i === pages.length - 1;
+        if (isFirstPage) {
+            const headerHeight = Math.round(meta.width * HEADER_HEIGHT_RATIO);
+            rects.push(`<rect x="0" y="0" width="${meta.width}" height="${headerHeight}" fill="white"/>`);
+        }
+        if (isLastPage) {
+            const footerHeight = Math.round(meta.width * FOOTER_HEIGHT_RATIO);
+            const footerY = Math.max(0, meta.height - footerHeight);
+            rects.push(`<rect x="0" y="${footerY}" width="${meta.width}" height="${meta.height - footerY}" fill="white"/>`);
+        }
+
+        const svgOverlay = Buffer.from(`<svg width="${meta.width}" height="${meta.height}" xmlns="http://www.w3.org/2000/svg">${rects.join('')}</svg>`);
+        const finalImageBuffer = await sharp(imgBuffer)
+            .composite([{ input: svgOverlay, top: 0, left: 0 }])
+            .jpeg({ quality: 92 })
+            .toBuffer();
+
+        const embeddedImg = await outDoc.embedJpg(finalImageBuffer);
+        const newPage = outDoc.addPage([pageW, pageH]);
+        newPage.drawImage(embeddedImg, { x: 0, y: 0, width: pageW, height: pageH });
+    }
+
+    // Header/footer removal always applies to image-based PDFs, so always save.
+    fs.writeFileSync(filePath, await outDoc.save());
+
+    return { method: 'image-ocr', count: imageMatches };
+}
+
+function toTitleCase(str) {
+    return String(str || '').split(/\s+/).filter(Boolean).map(w => {
+        if (/^[A-Z0-9]+$/.test(w)) return w; // keep acronyms/numbers as-is (e.g. "AI")
+        return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+    }).join(' ');
+}
+
+// Builds a clean, fully text-based (selectable/searchable) PDF of the answer
+// instead of relying on the target site's own PDF export, which can come out
+// as a rasterized screenshot rather than real text.
+async function buildAnswerPdf(prompt, markdown) {
+    const doc = await PDFDocument.create();
+    const fontRegular = await doc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
+    const fontItalic = await doc.embedFont(StandardFonts.HelveticaOblique);
+    const fontBoldItalic = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
+
+    const PAGE_W = 612, PAGE_H = 792, MARGIN = 56;
+    const CONTENT_W = PAGE_W - MARGIN * 2;
+    const TITLE_COLOR = rgb(0.09, 0.24, 0.42);
+    const RULE_COLOR = rgb(0.35, 0.55, 0.72);
+    const TEXT_COLOR = rgb(0.09, 0.09, 0.09);
+
+    let page = doc.addPage([PAGE_W, PAGE_H]);
+    let y = PAGE_H - MARGIN;
+
+    const ensureSpace = (needed) => {
+        if (y - needed < MARGIN) {
+            page = doc.addPage([PAGE_W, PAGE_H]);
+            y = PAGE_H - MARGIN;
+        }
+    };
+
+    const pickFont = (bold, italic) => (bold && italic) ? fontBoldItalic : bold ? fontBold : italic ? fontItalic : fontRegular;
+
+    // Splits inline text into styled runs based on **bold**, *italic* and `code`
+    const parseRuns = (text) => {
+        const runs = [];
+        const re = /\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`|([^*`]+)/g;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            if (m[1] !== undefined) runs.push({ text: m[1], bold: true, italic: true });
+            else if (m[2] !== undefined) runs.push({ text: m[2], bold: true, italic: false });
+            else if (m[3] !== undefined) runs.push({ text: m[3], bold: false, italic: true });
+            else if (m[4] !== undefined) runs.push({ text: m[4], bold: false, italic: false, code: true });
+            else if (m[5] !== undefined) runs.push({ text: m[5], bold: false, italic: false });
+        }
+        return runs;
+    };
+
+    // Draws a block of mixed-style, word-wrapped text starting on a fresh line
+    const drawParagraph = (text, opts = {}) => {
+        const { size = 11.5, lineHeight = 17, indent = 0, bulletPrefix = null, color = TEXT_COLOR } = opts;
+        const runs = parseRuns(text);
+        const words = [];
+        runs.forEach(run => {
+            run.text.split(/(\s+)/).forEach(part => {
+                if (part === '') return;
+                if (/^\s+$/.test(part)) { if (words.length) words[words.length - 1].trailingSpace = true; return; }
+                words.push({ text: part, bold: run.bold, italic: run.italic, code: run.code, trailingSpace: false });
+            });
+        });
+        if (!words.length) return;
+
+        ensureSpace(lineHeight);
+        let x = MARGIN + indent;
+        if (bulletPrefix) {
+            page.drawText(bulletPrefix, { x, y, size, font: fontRegular, color });
+            x += fontRegular.widthOfTextAtSize(bulletPrefix + ' ', size);
+        }
+        const startX = x;
+        const maxX = MARGIN + CONTENT_W;
+        const spaceWidth = fontRegular.widthOfTextAtSize(' ', size);
+
+        words.forEach((w) => {
+            const font = pickFont(w.bold, w.italic);
+            const wWidth = font.widthOfTextAtSize(w.text, size);
+            if (x > startX && x + wWidth > maxX) {
+                y -= lineHeight;
+                ensureSpace(lineHeight);
+                x = startX;
+            }
+            page.drawText(w.text, { x, y, size, font, color });
+            x += wWidth + (w.trailingSpace ? spaceWidth : 0);
+        });
+        y -= lineHeight;
+    };
+
+    // Walks the markdown-lite answer text block-by-block (headings, lists, paragraphs)
+    const renderBody = (markdownText) => {
+        const lines = markdownText.split('\n');
+        let i = 0;
+        while (i < lines.length) {
+            const trimmed = lines[i].trim();
+
+            if (trimmed === '') { y -= 6; i++; continue; }
+
+            const h1 = /^#\s+(.*)$/.exec(trimmed);
+            const h2 = /^##\s+(.*)$/.exec(trimmed);
+            const h3 = /^###\s+(.*)$/.exec(trimmed);
+            if (h1) { y -= 6; drawParagraph(h1[1], { size: 17, lineHeight: 23, color: TITLE_COLOR }); i++; continue; }
+            if (h2) { y -= 4; drawParagraph(h2[1], { size: 14.5, lineHeight: 20, color: TITLE_COLOR }); i++; continue; }
+            if (h3) { y -= 2; drawParagraph(h3[1], { size: 13, lineHeight: 19, color: TITLE_COLOR }); i++; continue; }
+
+            const ul = /^[-*]\s+(.*)$/.exec(trimmed);
+            if (ul) { drawParagraph(ul[1], { indent: 16, bulletPrefix: '\u2022' }); i++; continue; }
+
+            const ol = /^(\d+)[.)]\s+(.*)$/.exec(trimmed);
+            if (ol) { drawParagraph(ol[2], { indent: 16, bulletPrefix: `${ol[1]}.` }); i++; continue; }
+
+            // Merge consecutive plain lines into one paragraph
+            const para = [trimmed];
+            i++;
+            while (
+                i < lines.length && lines[i].trim() !== '' &&
+                !/^#{1,3}\s+/.test(lines[i].trim()) && !/^[-*]\s+/.test(lines[i].trim()) && !/^\d+[.)]\s+/.test(lines[i].trim())
+            ) {
+                para.push(lines[i].trim());
+                i++;
+            }
+            drawParagraph(para.join(' '));
+            y -= 4;
+        }
+    };
+
+    // Title
+    const title = toTitleCase(prompt).slice(0, 90) || 'Chat Answer';
+    page.drawText(title, { x: MARGIN, y, size: 24, font: fontBold, color: TITLE_COLOR });
+    y -= 8;
+    page.drawLine({ start: { x: MARGIN, y }, end: { x: MARGIN + CONTENT_W, y }, thickness: 2, color: RULE_COLOR });
+    y -= 26;
+
+    // "User: <prompt>" line
+    drawParagraph(`**User:** ${prompt}`, { size: 12, lineHeight: 18 });
+    y -= 10;
+
+    // Answer body
+    renderBody(markdown || '');
+
+    return doc.save();
+}
+
 async function initBrowser() {
-    browser = await chromium.launch({ headless: false });
+    browser = await chromium.launch({ headless: false, channel: 'chrome' });
+    browser.on('disconnected', () => {
+        addLog('⚠️ Browser disconnected/closed');
+        browser = null;
+    });
     addLog('✅ Browser ready');
+}
+
+async function ensureBrowser() {
+    if (!browser || !browser.isConnected()) {
+        addLog('🔁 Browser not connected, relaunching...');
+        try { if (browser) await browser.close(); } catch (e) {}
+        await initBrowser();
+    }
 }
 
 async function shot(page) {
     try { lastScreenshot = await page.screenshot({ type: 'png' }); } catch(e) {}
+}
+
+// Shared by both the signed-in flow (scrape) and the no-login "Auto" flow
+// (scrapeAuto): waits for the answer to finish streaming and for the
+// Like/Dislike buttons to appear (confirming the answer is fully complete),
+// then isolates the answer strictly between the Copy button (top-right of the
+// user's prompt) and the Like/Dislike buttons (bottom of the answer), and
+// extracts any sources shown in the right-hand sources panel.
+async function waitAndExtractAnswer(page, prompt, email) {
+    let resp = '';
+
+    try {
+        // First: Wait for response text to stabilize (answer streaming complete)
+        addLog('⏳ Waiting for answer to complete streaming - monitoring text stability...');
+        let lastLen = 0;
+        let stableCount = 0;
+        let checkCount = 0;
+        const maxChecks = 240; // 2 minutes max
+
+        while (stableCount < 4 && checkCount < maxChecks) { // 4 checks = ~2 seconds at 500ms intervals
+            await page.waitForTimeout(500);
+            const currentResp = await page.evaluate(() => document.body.innerText);
+            if (currentResp.length === lastLen) {
+                stableCount++;
+            } else {
+                stableCount = 0;
+            }
+            lastLen = currentResp.length;
+            checkCount++;
+        }
+        addLog('✅ Answer streaming complete - text is stable!');
+
+        // Second: Now check for like/dislike buttons at bottom of response (final confirmation)
+        addLog('⏳ Waiting for like/dislike buttons to appear at bottom of answer...');
+        try {
+            await page.waitForSelector('button[aria-label*="like" i], button[aria-label*="dislike" i], button[title*="Like" i], button[title*="Dislike" i], [data-testid*="like"], [data-testid*="dislike"]', {
+                timeout: 10000 // 10 second timeout to find like/dislike buttons
+            });
+            addLog('✅ Like/Dislike buttons found - answer is fully complete!');
+        } catch (e) {
+            addLog('⚠️ Like/Dislike buttons not found, but answer text is stable - proceeding with extraction');
+        }
+
+        await shot(page);
+
+    } catch (e) {
+        addLog(`⚠️ Error: ${e.message}`);
+    }
+
+    // STEP: Extract sources from right panel
+    let sources = [];
+    addLog('\n📚 Extracting sources from right panel');
+    try {
+        // Look for sources button/indicator in right panel (N Sources). Use a short
+        // visibility check first - a Playwright Locator is always truthy even when it
+        // matches nothing, so without this the code would block on .click() for its
+        // full default timeout when a page simply has no sources to show.
+        const sourcesBtn = page.locator('button:has-text("Source"), [aria-label*="source" i]').first();
+        const sourcesBtnVisible = await sourcesBtn.isVisible({ timeout: 1500 }).catch(() => false);
+        if (sourcesBtnVisible) {
+            addLog('📍 Found sources button - clicking...');
+            await sourcesBtn.click({ timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(1000);
+            addLog('✅ Sources panel opened');
+
+            // Scroll to bottom of sources panel to load all sources
+            const totalSources = await page.evaluate(async () => {
+                const panel = document.querySelector('[class*="source"], [aria-label*="source" i]')?.parentElement;
+                if (!panel) return 0;
+
+                let scrollTop = 0;
+                let previousHeight = 0;
+                let attempts = 0;
+
+                while (attempts < 20) {
+                    panel.scrollTop = panel.scrollHeight;
+                    await new Promise(r => setTimeout(r, 300));
+
+                    if (panel.scrollHeight === previousHeight) break;
+                    previousHeight = panel.scrollHeight;
+                    attempts++;
+                }
+
+                return document.querySelectorAll('a[href*="http"]').length;
+            });
+
+            addLog(`📍 Total source elements found: ${totalSources}`);
+            await page.waitForTimeout(500);
+            await shot(page);
+
+            // Extract all URLs from sources panel
+            const urls = await page.evaluate(() => {
+                const sources = [];
+                document.querySelectorAll('a[href]').forEach(link => {
+                    const href = link.getAttribute('href');
+                    if (href && (href.startsWith('http') || href.startsWith('www'))) {
+                        const text = link.textContent.trim();
+                        sources.push({
+                            url: href,
+                            title: text || new URL(href).hostname
+                        });
+                    }
+                });
+                // Remove duplicates
+                return sources.filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i);
+            });
+
+            sources = urls;
+            addLog(`✅ Extracted ${sources.length} unique source URLs`);
+            sources.slice(0, 5).forEach((s, i) => addLog(`   ${i + 1}. ${s.title.substring(0, 50)}`));
+            if (sources.length > 5) addLog(`   ... and ${sources.length - 5} more`);
+        } else {
+            addLog('ℹ️ No sources panel found - skipping immediately, not waiting on it');
+        }
+    } catch (e) {
+        addLog(`⚠️ Sources error: ${e.message}`);
+}
+
+    // Extract response: scope the text strictly between the Copy button (below the
+    // question) and the Like/Dislike buttons (after the answer), so sidebar/header/
+    // footer chrome never leaks into the extracted answer.
+    addLog('\n🎯 Isolating answer between Copy button and Like/Dislike buttons');
+    const isolated = await page.evaluate(() => {
+        const isCopyBtn = (el) => {
+            const label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '').trim().toLowerCase();
+            return label === 'copy' || label.startsWith('copy ') || label === 'copy message' || label === 'copy text';
+        };
+        const isLikeDislikeBtn = (el) => {
+            const label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-testid') || '').toLowerCase();
+            // Covers both use.ai ( "like"/"dislike"/"thumbs" ) and ChatGPT
+            // ( "Good response"/"Bad response" ) button labelling conventions.
+            return label.includes('like') || label.includes('dislike') || label.includes('thumbs')
+                || label.includes('good response') || label.includes('bad response');
+        };
+
+        // Convert the answer's real DOM structure into Markdown so that bold text,
+        // bullet lists, numbered lists and headings survive extraction (plain
+        // innerText silently drops all of this semantic formatting).
+        const htmlToMarkdown = (root) => {
+            const walk = (node) => {
+                if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+                if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+                const tag = node.tagName.toLowerCase();
+                const childText = () => Array.from(node.childNodes).map(walk).join('');
+
+                switch (tag) {
+                    case 'h1': return `\n# ${childText().trim()}\n\n`;
+                    case 'h2': return `\n## ${childText().trim()}\n\n`;
+                    case 'h3': case 'h4': case 'h5': case 'h6': return `\n### ${childText().trim()}\n\n`;
+                    case 'strong': case 'b': { const t = childText(); return t.trim() ? `**${t}**` : t; }
+                    case 'em': case 'i': { const t = childText(); return t.trim() ? `*${t}*` : t; }
+                    case 'code':
+                        return node.closest('pre') ? childText() : `\`${childText()}\``;
+                    case 'pre':
+                        return `\n\`\`\`\n${childText().trim()}\n\`\`\`\n\n`;
+                    case 'a': {
+                        const href = node.getAttribute('href') || '';
+                        const t = childText();
+                        return href ? `[${t}](${href})` : t;
+                    }
+                    case 'img': {
+                        // Preserve inline images (charts, diagrams, screenshots) so the
+                        // answer palette carries images alongside text, not just text.
+                        const src = node.src || node.getAttribute('src') || '';
+                        const alt = (node.getAttribute('alt') || 'image').trim().replace(/[\[\]]/g, '');
+                        return src ? `\n![${alt}](${src})\n\n` : '';
+                    }
+                    case 'br': return '\n';
+                    case 'hr': return '\n---\n\n';
+                    case 'li': return childText();
+                    case 'ul': {
+                        const items = Array.from(node.children).filter(c => c.tagName === 'LI');
+                        return '\n' + items.map(li => `- ${walk(li).trim()}`).join('\n') + '\n\n';
+                    }
+                    case 'ol': {
+                        const items = Array.from(node.children).filter(c => c.tagName === 'LI');
+                        return '\n' + items.map((li, i) => `${i + 1}. ${walk(li).trim()}`).join('\n') + '\n\n';
+                    }
+                    case 'table': {
+                        // Convert real <table> markup into GFM markdown tables so the
+                        // frontend's markdown table renderer can reproduce the same
+                        // look (headers + rows) shown in the reference formatting.
+                        const rows = Array.from(node.querySelectorAll(':scope > thead > tr, :scope > tbody > tr, :scope > tr'));
+                        if (!rows.length) return '';
+                        const cellText = (cell) => walk(cell).replace(/\|/g, '\\|').replace(/\s*\n+\s*/g, ' ').trim();
+                        const headerCells = Array.from(rows[0].children).map(cellText);
+                        if (!headerCells.length) return '';
+                        const bodyRows = rows.slice(1).map(r => Array.from(r.children).map(cellText));
+                        let md = '\n| ' + headerCells.join(' | ') + ' |\n';
+                        md += '|' + headerCells.map(() => ' --- ').join('|') + '|\n';
+                        bodyRows.forEach(cells => { md += '| ' + cells.join(' | ') + ' |\n'; });
+                        return md + '\n';
+                    }
+                    case 'button': case 'svg': case 'style': case 'script': case 'noscript': case 'nav':
+                        // Skip UI chrome (icon buttons, inline controls) so their labels
+                        // never leak into the extracted answer text.
+                        return '';
+                    case 'p': case 'div': case 'section': case 'article': {
+                        const inner = childText().trim();
+                        return inner ? `${inner}\n\n` : '';
+                    }
+                    default:
+                        return childText();
+                }
+            };
+            return walk(root).replace(/\n{3,}/g, '\n\n').trim();
+        };
+
+        const allEls = Array.from(document.querySelectorAll('body *'));
+        const copyBtns = allEls.filter(el => el.tagName === 'BUTTON' && isCopyBtn(el));
+        const likeDislikeBtns = allEls.filter(el => el.tagName === 'BUTTON' && isLikeDislikeBtn(el));
+
+        if (!copyBtns.length) return null;
+        const startEl = copyBtns[copyBtns.length - 1];
+        const startIdx = allEls.indexOf(startEl);
+
+        let endEl = null;
+        for (const btn of likeDislikeBtns) {
+            if (allEls.indexOf(btn) > startIdx) { endEl = btn; break; }
+        }
+        if (!endEl) return null;
+
+        try {
+            const range = document.createRange();
+            range.setStartAfter(startEl);
+            range.setEndBefore(endEl);
+            const frag = range.cloneContents();
+            const div = document.createElement('div');
+            div.appendChild(frag);
+            const markdown = htmlToMarkdown(div);
+            return markdown && markdown.length > 3 ? markdown : (div.innerText || div.textContent || '').trim();
+        } catch (e) {
+            return null;
+        }
+    }).catch(() => null);
+
+    if (isolated && isolated.length > 3) {
+        resp = isolated;
+        addLog(`✅ Isolated answer text between Copy and Like/Dislike buttons (${resp.length} chars)`);
+    } else {
+        // Never dump the whole page (nav, sidebar, login prompt, cookie banner all
+        // live there). Prefer the <main> content region, which on both use.ai and
+        // ChatGPT excludes that chrome, and only fall back to the full body as an
+        // absolute last resort.
+        addLog('⚠️ Could not isolate answer boundaries - falling back to main content region');
+        resp = await page.evaluate(() => {
+            const scoped = document.querySelector('main, [role="main"], #__next main');
+            return (scoped ? scoped.innerText : document.body.innerText) || '';
+        });
+    }
+
+    // Clean up response - remove unwanted elements
+    resp = resp.trim();
+
+    // Remove cookie notice
+    resp = resp.replace(/We use cookies.*?Accept/gis, '');
+    resp = resp.replace(/Reject\s+Accept/gi, '');
+    resp = resp.replace(/^\s*(Accept all|Reject non-essential|Cookie preferences)\s*$/gim, '');
+
+    // Remove "Sign in" button area
+    resp = resp.replace(/Sign in/gi, '');
+
+    // Remove the user's prompt from the response (don't show duplicate) - all occurrences
+    resp = resp.replace(new RegExp(prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '');
+
+    // Remove the sign-in email and its capitalized display-name variant
+    if (email) {
+        resp = resp.replace(new RegExp(email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '');
+        const localPart = email.split('@')[0];
+        if (localPart) {
+            const displayGuess = localPart.charAt(0).toUpperCase() + localPart.slice(1);
+            resp = resp.replace(new RegExp('^\\s*' + displayGuess.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$', 'gim'), '');
+        }
+    }
+    // Remove a stray single-letter avatar initial on its own line (e.g. "D")
+    resp = resp.replace(/^[A-Z]\s*$/gim, '');
+
+    // Remove known sidebar/UI chrome lines that sometimes leak through in the fallback path
+    const junkLines = [
+        'Start new', 'Files & documents', 'Projects', 'More', 'My chats', 'Share Feedback',
+        'Copy chat', 'Download chat', 'Share', 'Go Pro', 'File Preview', 'No file data available',
+        'Activity', 'Deep research is initiating', 'No sources found', 'Sources',
+        'Copy', 'Like', 'Dislike', 'Regenerate', 'Edit',
+        // ChatGPT-specific chrome (header, sidebar, login prompt, footer disclaimer)
+        'ChatGPT', 'ChatGPT is AI and can make mistakes.', 'New chat', 'Search chats',
+        'Plugins', 'Deep research', 'See plans and pricing', 'Settings', 'Help',
+        'Get responses tailored to you',
+        'Log in to get answers based on saved chats, plus create images and upload files.',
+        'Log in', 'Sign up for free', 'Good response', 'Bad response'
+    ];
+    junkLines.forEach(phrase => {
+        const re = new RegExp('^\\s*' + phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$', 'gim');
+        resp = resp.replace(re, '');
+    });
+
+    // Remove model selector and duplicates
+    resp = resp.replace(/Auto\s+Auto/gi, '');
+    resp = resp.replace(/Auto\s+Sonnet 5\s+Fable 5/gi, '');
+    resp = resp.replace(/Model:/gi, '');
+    resp = resp.replace(/^(Auto|Sonnet 5|Fable 5|GPT-5\.6 Terra|Gemini 3\.1 Pro)\s*\n/gim, '');
+    resp = resp.replace(/^(Auto|Sonnet 5|Fable 5|GPT-5\.6 Terra|Gemini 3\.1 Pro)$/gim, '');
+
+    // Clean up excessive whitespace
+    resp = resp.replace(/\n\s*\n\s*\n/g, '\n\n');
+    resp = resp.replace(/^\s+/gm, '');
+
+    if (resp.length > 5000) {
+        resp = resp.substring(0, 5000) + '...';
+    }
+
+    addLog(`✅ Extracted ${resp.length} chars`);
+    addLog('\n✅ COMPLETE');
+
+    return { resp: resp.trim(), sources };
 }
 
 async function scrape(email, prompt, model, retryCount = 0) {
@@ -35,6 +666,7 @@ async function scrape(email, prompt, model, retryCount = 0) {
     else addLog(`🚀 START | Email: ${email} | Prompt: ${prompt} | Model: ${model}`);
     addLog('═'.repeat(70));
 
+    await ensureBrowser();
     const ctx = await browser.newContext();
     const page = await ctx.newPage();
 
@@ -70,23 +702,57 @@ async function scrape(email, prompt, model, retryCount = 0) {
         await continueBtn.click();
         addLog('✅ Continue button clicked');
 
-        // Immediately try to bypass paywall by navigating with paywall flag
-        try {
-            addLog('\n🔁 Attempting paywall bypass via query param');
-            await page.goto('https://use.ai/?paywall=false', { waitUntil: 'networkidle', timeout: 5000 }).catch(() => null);
-            await page.waitForTimeout(500);
-            await shot(page);
-            const body = await page.evaluate(() => document.body.innerText);
-            if (/Upgrade to PRO|Upgrade|Go Pro|pricing|payment/i.test(body)) {
-                addLog('⚠️ Bypass param did not remove paywall');
-            } else {
-                addLog('✅ Navigated to paywall=false URL (paywall bypass may have worked)');
+        addLog('\n✅ STEP 6: Waiting for "Account created successfully" or "Check your email"');
+        let accountCreated = false;
+        let checkEmailSeen = false;
+        const maxStatusChecks = 16; // ~8s at 500ms intervals
+        for (let i = 0; i < maxStatusChecks; i++) {
+            const statusText = await page.evaluate(() => document.body.innerText).catch(() => '');
+            if (statusText.includes('Account created successfully')) {
+                accountCreated = true;
+                break;
             }
-        } catch (e) {
-            addLog(`⚠️ Error during paywall bypass navigation: ${e.message}`);
+            if (statusText.includes('Check your email')) {
+                checkEmailSeen = true;
+                break;
+            }
+            await page.waitForTimeout(500);
         }
 
-        addLog('\n⏳ STEP 6: Check for "Check your email" (immediate check)');
+        if (!checkEmailSeen) {
+            // Either the explicit success message was seen, or no email-verification
+            // prompt showed up within the wait window - either way the account is
+            // ready, so treat it as created and still run the paywall bypass.
+            accountCreated = true;
+        }
+
+        if (accountCreated) {
+            addLog('✅ Account ready (created successfully / no verification required) - confirmed');
+        } else {
+            addLog('⚠️ "Check your email" detected while waiting - will retry with a new email');
+        }
+        await shot(page);
+
+        if (accountCreated) {
+            addLog('\n🔁 STEP 7: Paywall bypass via query param (running because account was created)');
+            try {
+                await page.goto('https://use.ai/?paywall=false', { waitUntil: 'networkidle', timeout: 5000 }).catch(() => null);
+                await page.waitForTimeout(500);
+                await shot(page);
+                const body = await page.evaluate(() => document.body.innerText);
+                if (/Upgrade to PRO|Upgrade|Go Pro|pricing|payment/i.test(body)) {
+                    addLog('⚠️ Bypass param did not remove paywall');
+                } else {
+                    addLog('✅ Navigated to paywall=false URL (paywall bypass may have worked)');
+                }
+            } catch (e) {
+                addLog(`⚠️ Error during paywall bypass navigation: ${e.message}`);
+            }
+        } else {
+            addLog('\n⏭️ STEP 7: Skipped paywall bypass (account not confirmed created yet)');
+        }
+
+        addLog('\n⏳ STEP 8: Check for "Check your email" (immediate check)');
         await page.waitForTimeout(300);
         await shot(page);
         
@@ -121,7 +787,7 @@ async function scrape(email, prompt, model, retryCount = 0) {
         }
         addLog('✅ No email verification check');
 
-        addLog('\n🎯 STEP 7: Close popup if exists (enhanced)');
+        addLog('\n🎯 STEP 9: Close popup if exists (enhanced)');
         try {
             // More aggressive popup detection and closing
             const allButtons = await page.locator('button').all();
@@ -156,28 +822,30 @@ async function scrape(email, prompt, model, retryCount = 0) {
             await shot(page);
         } catch(e) { addLog(`⚠️ Error closing popup: ${e.message}`); }
 
-        addLog(`\n🤖 STEP 8: Select model (${model})`);
+        addLog(`\n🤖 STEP 10: Select model (${model})`);
         if (model && model !== 'Auto') {
             try {
-                const mbtn = await page.locator('button:has-text("Auto")').first();
-                if (await mbtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-                    await mbtn.click();
-                    await page.waitForTimeout(300);
-                    const mopt = await page.locator(`text="${model}"`).first();
-                    if (await mopt.isVisible({ timeout: 1500 }).catch(() => false)) {
-                        await mopt.click();
-                        await page.waitForTimeout(300);
-                        await shot(page);
-                        addLog(`✅ Selected: ${model}`);
-                    } else addLog(`⚠️ Model not found`);
-                } else addLog('⚠️ Selector not found');
-            } catch(e) { addLog(`⚠️ Error: ${e.message}`); }
+                const mbtn = page.locator('button:has-text("Auto")').first();
+                await mbtn.click({ timeout: 4000 });
+                addLog('✅ Model dropdown opened');
+                await page.waitForTimeout(300);
+                await shot(page);
+
+                const mopt = page.locator(`text="${model}"`).first();
+                await mopt.click({ timeout: 4000 });
+                await page.waitForTimeout(300);
+                await shot(page);
+                addLog(`✅ Selected: ${model}`);
+            } catch (e) {
+                addLog(`⚠️ Could not select model "${model}": ${e.message.split('\n')[0]} - continuing with default model`);
+                await page.keyboard.press('Escape').catch(() => {});
+            }
         } else addLog('✅ Using Auto');
 
-        addLog('\n💬 STEP 9: Chat interface ready');
+        addLog('\n💬 STEP 11: Chat interface ready');
         addLog('✅ Ready');
 
-        addLog('\n📝 STEP 10: Fill prompt input');
+        addLog('\n📝 STEP 12: Fill prompt input');
         const sels = ['textarea[placeholder*="message" i]', 'textarea[placeholder*="prompt" i]', 'input[placeholder*="message" i]', 'textarea', 'input[type="text"]'];
         let inp = null;
         for (const sel of sels) {
@@ -197,159 +865,171 @@ async function scrape(email, prompt, model, retryCount = 0) {
         await shot(page);
         addLog(`✅ Filled`);
 
-        addLog('\n🚀 STEP 11: Send (Enter)');
+        addLog('\n🚀 STEP 13: Send (Enter)');
         await inp.press('Enter');
         await shot(page);
         addLog('✅ Sent - monitoring for response completion');
 
-        let resp = '';
+        const { resp: extractedResp, sources } = await waitAndExtractAnswer(page, prompt, email);
+        let resp = extractedResp;
 
+        // STEP 15: Generate a clean, fully text-based PDF of the answer ourselves
+        // (the site's own "Download chat" export can come out as a flat screenshot
+        // image rather than real text, which looks poor and isn't searchable/selectable).
+        let pdfFile = null;
+        addLog('\n📄 STEP 15: Generating answer PDF');
         try {
-            // First: Wait for response text to stabilize (answer streaming complete)
-            addLog('⏳ Waiting for answer to complete streaming - monitoring text stability...');
-            let lastLen = 0;
-            let stableCount = 0;
-            let checkCount = 0;
-            const maxChecks = 240; // 2 minutes max
-            
-            while (stableCount < 4 && checkCount < maxChecks) { // 4 checks = ~2 seconds at 500ms intervals
-                await page.waitForTimeout(500);
-                const currentResp = await page.evaluate(() => document.body.innerText);
-                if (currentResp.length === lastLen) {
-                    stableCount++;
-                } else {
-                    stableCount = 0;
-                }
-                lastLen = currentResp.length;
-                checkCount++;
-            }
-            addLog('✅ Answer streaming complete - text is stable!');
-            
-            // Second: Now check for like/dislike buttons at bottom of response (final confirmation)
-            addLog('⏳ Waiting for like/dislike buttons to appear at bottom of answer...');
-            try {
-                await page.waitForSelector('button[aria-label*="like" i], button[aria-label*="dislike" i], button[title*="Like" i], button[title*="Dislike" i], [data-testid*="like"], [data-testid*="dislike"]', { 
-                    timeout: 10000 // 10 second timeout to find like/dislike buttons
-                });
-                addLog('✅ Like/Dislike buttons found - answer is fully complete!');
-            } catch (e) {
-                addLog('⚠️ Like/Dislike buttons not found, but answer text is stable - proceeding with extraction');
-            }
-            
-            await shot(page);
-            
+            const pdfBytes = await buildAnswerPdf(prompt, resp);
+            const safeName = safePdfFilename(prompt);
+            const savePath = path.join(DOWNLOADS_DIR, safeName);
+            fs.writeFileSync(savePath, pdfBytes);
+            pdfFile = safeName;
+            addLog(`✅ Answer PDF generated: ${safeName}`);
         } catch (e) {
-            addLog(`⚠️ Error: ${e.message}`);
+            addLog(`⚠️ Could not generate answer PDF: ${e.message}`);
         }
-
-        // STEP 12: Extract sources from right panel
-        let sources = [];
-        addLog('\n📚 STEP 12: Extracting sources from right panel');
-        try {
-            // Look for sources button/indicator in right panel (N Sources)
-            const sourcesBtn = await page.locator('button:has-text("Source"), [aria-label*="source" i]').first();
-            if (sourcesBtn) {
-                addLog('📍 Found sources button - clicking...');
-                await sourcesBtn.click();
-                await page.waitForTimeout(1000);
-                addLog('✅ Sources panel opened');
-
-                // Scroll to bottom of sources panel to load all sources
-                const totalSources = await page.evaluate(async () => {
-                    const panel = document.querySelector('[class*="source"], [aria-label*="source" i]')?.parentElement;
-                    if (!panel) return 0;
-                    
-                    let scrollTop = 0;
-                    let previousHeight = 0;
-                    let attempts = 0;
-                    
-                    while (attempts < 20) {
-                        panel.scrollTop = panel.scrollHeight;
-                        await new Promise(r => setTimeout(r, 300));
-                        
-                        if (panel.scrollHeight === previousHeight) break;
-                        previousHeight = panel.scrollHeight;
-                        attempts++;
-                    }
-                    
-                    return document.querySelectorAll('a[href*="http"]').length;
-                });
-                
-                addLog(`📍 Total source elements found: ${totalSources}`);
-                await page.waitForTimeout(500);
-                await shot(page);
-
-                // Extract all URLs from sources panel
-                const urls = await page.evaluate(() => {
-                    const sources = [];
-                    document.querySelectorAll('a[href]').forEach(link => {
-                        const href = link.getAttribute('href');
-                        if (href && (href.startsWith('http') || href.startsWith('www'))) {
-                            const text = link.textContent.trim();
-                            sources.push({ 
-                                url: href, 
-                                title: text || new URL(href).hostname 
-                            });
-                        }
-                    });
-                    // Remove duplicates
-                    return sources.filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i);
-                });
-
-                sources = urls;
-                addLog(`✅ Extracted ${sources.length} unique source URLs`);
-                sources.slice(0, 5).forEach((s, i) => addLog(`   ${i + 1}. ${s.title.substring(0, 50)}`));
-                if (sources.length > 5) addLog(`   ... and ${sources.length - 5} more`);
-            } else {
-                addLog('ℹ️ No sources panel found');
-            }
-        } catch (e) {
-            addLog(`⚠️ Sources error: ${e.message}`);
-        }
-
-        // Extract response from page
-        resp = await page.evaluate(() => document.body.innerText);
-        
-        // Clean up response - remove unwanted elements
-        resp = resp.trim();
-        
-        // Remove cookie notice
-        resp = resp.replace(/We use cookies.*?Accept/gis, '');
-        resp = resp.replace(/Reject\s+Accept/gi, '');
-        
-        // Remove "Sign in" button area
-        resp = resp.replace(/Sign in/gi, '');
-        
-        // Remove the user's prompt from the response (don't show duplicate)
-        resp = resp.replace(new RegExp(prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '');
-        
-        // Remove model selector and duplicates
-        resp = resp.replace(/Auto\s+Auto/gi, '');
-        resp = resp.replace(/Auto\s+Sonnet 5\s+Fable 5/gi, '');
-        resp = resp.replace(/Model:/gi, '');
-        resp = resp.replace(/^(Auto|Sonnet 5|Fable 5|GPT-5\.6 Terra|Gemini 3\.1 Pro)\s*\n/gim, '');
-        resp = resp.replace(/^(Auto|Sonnet 5|Fable 5|GPT-5\.6 Terra|Gemini 3\.1 Pro)$/gim, '');
-        
-        // Clean up excessive whitespace
-        resp = resp.replace(/\n\s*\n\s*\n/g, '\n\n');
-        resp = resp.replace(/^\s+/gm, '');
-        
-        if (resp.length > 5000) {
-            resp = resp.substring(0, 5000) + '...';
-        }
-        
-        addLog(`✅ Extracted ${resp.length} chars`);
-        addLog('\n✅ COMPLETE');
 
         addLog('═'.repeat(70));
         await ctx.close();
-        return { response: resp.trim(), sources };
+        return { response: resp.trim(), sources, pdfFile };
 
     } catch(err) {
         addLog(`\n❌ ERROR: ${err.message}`);
         addLog('═'.repeat(70));
+        try { await shot(page); } catch (e) {}
+        try { await ctx.close(); } catch (e) {}
+        throw err;
+    }
+}
+
+function safePdfFilename(prompt) {
+    const slug = prompt.slice(0, 40).replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '');
+    return `${Date.now()}-${slug || 'chat'}.pdf`;
+}
+
+// When the model is "Auto", skip the use.ai sign-in flow entirely and get the
+// answer by opening a public prompt-in-URL page instead (chosen at random),
+// so no account/email is ever needed for the default model.
+const AUTO_TARGETS = [
+    { name: 'use.ai', buildUrl: (p) => `https://use.ai/chat?prompt=${encodeURIComponent(p)}&send=true` },
+    { name: 'ChatGPT', buildUrl: (p) => `https://chatgpt.com/?q=${encodeURIComponent(p)}` },
+];
+
+async function scrapeAuto(prompt) {
+    addLog('');
+    addLog('═'.repeat(70));
+    addLog(`🚀 AUTO START (no sign-in) | Prompt: ${prompt}`);
+    addLog('═'.repeat(70));
+
+    await ensureBrowser();
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    const target = AUTO_TARGETS[Math.floor(Math.random() * AUTO_TARGETS.length)];
+
+    try {
+        const url = target.buildUrl(prompt);
+        addLog(`\n🎲 Routed to ${target.name} (random pick, no login required)`);
+        addLog(`📍 Navigating: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await shot(page);
+
+        // Same monitoring + extraction logic as the signed-in flow: wait for the
+        // answer to fully stream and the Like/Dislike buttons to appear, then
+        // isolate strictly between the Copy button and the Like/Dislike buttons
+        // (and grab any sources panel entries), instead of a generic heuristic.
+        const { resp: extractedResp, sources } = await waitAndExtractAnswer(page, prompt, null);
+        const resp = extractedResp;
+
+        addLog(`✅ AUTO MODE extracted ${resp.length} chars from ${target.name}`);
+
+        let pdfFile = null;
+        try {
+            const pdfBytes = await buildAnswerPdf(prompt, resp);
+            const safeName = safePdfFilename(prompt);
+            fs.writeFileSync(path.join(DOWNLOADS_DIR, safeName), pdfBytes);
+            pdfFile = safeName;
+            addLog(`✅ Answer PDF generated: ${safeName}`);
+        } catch (e) {
+            addLog(`⚠️ Could not generate answer PDF: ${e.message}`);
+        }
+
+        addLog('═'.repeat(70));
         await ctx.close();
+        return { response: resp, sources, pdfFile };
+    } catch (err) {
+        addLog(`\n❌ AUTO MODE ERROR (${target.name}): ${err.message}`);
+        addLog('═'.repeat(70));
+        try { await shot(page); } catch (e) {}
+        try { await ctx.close(); } catch (e) {}
+        throw err;
+    }
+}
+
+// Dedicated to the "Create images" composer. Deliberately does NOT reuse the
+// chat flow's steps (no streaming-text wait, no Like/Dislike wait, no sources
+// panel, no Copy/Like-Dislike isolation, no PDF generation, no cleanup regex).
+// It only does: navigate to use.ai's prompt-in-URL endpoint, wait until the
+// generated image (and its download affordance) appears, grab the image, and
+// hand it back so the frontend can display it in the answer palette.
+async function scrapeImage(prompt) {
+    addLog('');
+    addLog('═'.repeat(70));
+    addLog(`🖼️ IMAGE START (no sign-in) | Prompt: ${prompt}`);
+    addLog('═'.repeat(70));
+
+    await ensureBrowser();
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+
+    try {
+        // Bookend the user's description with explicit instructions so the
+        // target actually generates an image rather than just describing one.
+        const fullPrompt = `Create an image ${prompt} Generate image`;
+        const url = `https://use.ai/chat?prompt=${encodeURIComponent(fullPrompt)}&send=true`;
+        addLog(`📝 Full prompt sent: ${fullPrompt}`);
+        addLog(`📍 Navigating: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await shot(page);
+
+        addLog('⏳ Waiting for the generated image / download button to appear...');
+        let imageUrl = null;
+        const maxChecks = 90; // ~90 seconds - image generation can be slow
+        for (let i = 0; i < maxChecks; i++) {
+            imageUrl = await page.evaluate(() => {
+                const hasDownloadHint = !!document.querySelector(
+                    'button[aria-label*="download" i], [title*="download" i], a[download]'
+                );
+                const imgs = Array.from(document.querySelectorAll('img'))
+                    .filter(img => img.src && img.naturalWidth >= 200 && img.naturalHeight >= 200)
+                    .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
+
+                if (!imgs.length) return null;
+                // Prefer waiting for the download affordance too when present, but
+                // don't block forever if the site never shows one for a given image.
+                return hasDownloadHint || imgs.length ? imgs[0].src : null;
+            }).catch(() => null);
+
+            if (imageUrl) break;
+            await page.waitForTimeout(1000);
+        }
+        await shot(page);
+
+        if (!imageUrl) {
+            addLog('⚠️ No image appeared within the wait window');
+            addLog('═'.repeat(70));
+            await ctx.close();
+            return { response: 'Sorry, no image was generated in time. Please try again.', sources: [] };
+        }
+
+        addLog(`✅ Image found: ${imageUrl}`);
+        addLog('═'.repeat(70));
+        await ctx.close();
+        return { response: `![Generated image](${imageUrl})`, sources: [] };
+    } catch (err) {
+        addLog(`\n❌ IMAGE MODE ERROR: ${err.message}`);
+        addLog('═'.repeat(70));
+        try { await shot(page); } catch (e) {}
+        try { await ctx.close(); } catch (e) {}
         throw err;
     }
 }
@@ -372,16 +1052,54 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/api/scrape', async (req, res) => {
     const { prompt, model, email } = req.body;
-    if (!prompt || !email) return res.status(400).json({ success: false, error: 'Missing data' });
+    const chosenModel = model || 'Auto';
+    const isAuto = chosenModel.trim().toLowerCase() === 'auto';
+
+    if (!prompt) return res.status(400).json({ success: false, error: 'Missing data' });
+    if (!isAuto && !email) return res.status(400).json({ success: false, error: 'Missing data' });
+
     try {
         const start = Date.now();
-        const result = await scrape(email, prompt, model || 'Auto');
+        const result = isAuto ? await scrapeAuto(prompt) : await scrape(email, prompt, chosenModel);
         const duration = Date.now() - start;
-        res.json({ success: true, data: { response: result.response, sources: result.sources, model: model || 'Auto', duration, timestamp: new Date().toISOString() } });
+        const pdfUrl = result.pdfFile ? `/api/download/${encodeURIComponent(result.pdfFile)}` : null;
+        res.json({ success: true, data: { response: result.response, sources: result.sources, model: chosenModel, duration, timestamp: new Date().toISOString(), pdfUrl } });
     } catch(err) {
         addLog(`API Error: ${err.message}`);
         res.status(500).json({ success: false, error: err.message });
     }
+});
+
+app.post('/api/generate-image', async (req, res) => {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ success: false, error: 'Missing prompt' });
+
+    try {
+        const start = Date.now();
+        const result = await scrapeImage(prompt);
+        const duration = Date.now() - start;
+        res.json({ success: true, data: { response: result.response, sources: result.sources, model: 'Images', duration, timestamp: new Date().toISOString(), pdfUrl: null } });
+    } catch (err) {
+        addLog(`API Error: ${err.message}`);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/download/:filename', (req, res) => {
+    const filename = path.basename(req.params.filename); // prevent path traversal
+    const filePath = path.join(DOWNLOADS_DIR, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ success: false, error: 'File not found' });
+    res.download(filePath, filename, (err) => {
+        if (err) {
+            addLog(`Download error for ${filename}: ${err.message}`);
+            return;
+        }
+        // Delete the PDF once it has been fully sent to the client
+        fs.unlink(filePath, (unlinkErr) => {
+            if (unlinkErr) addLog(`Failed to delete PDF after download: ${unlinkErr.message}`);
+            else addLog(`🗑️ Deleted PDF after download: ${filename}`);
+        });
+    });
 });
 
 async function start() {
@@ -394,5 +1112,10 @@ async function start() {
     });
 }
 
-process.on('SIGINT', async () => { addLog('Shutdown'); if (browser) await browser.close(); process.exit(0); });
+process.on('SIGINT', async () => {
+    addLog('Shutdown');
+    if (browser) await browser.close();
+    if (ocrWorker) await ocrWorker.terminate().catch(() => {});
+    process.exit(0);
+});
 start().catch(console.error);
