@@ -1,0 +1,17 @@
+# Render Blueprint
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: barqverse-backend
+    env: node
+    region: oregon
+    plan: starter
+    buildCommand: npm install && npx playwright install chromium --with-deps
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

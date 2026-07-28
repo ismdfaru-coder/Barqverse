@@ -1,12 +1,12 @@
 {
-  "name": "use-ai-scraper",
+  "name": "barqverse-backend",
   "version": "1.0.0",
   "description": "Scrape use.ai responses and integrate with React chat app",
-  "main": "backend-api.ts",
+  "main": "backend-server.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only backend-api.ts",
     "build": "tsc",
-    "start": "node dist/backend-api.js",
+    "start": "node backend-server.js",
     "scraper:test": "ts-node use-ai-scraper.ts",
     "type-check": "tsc --noEmit"
   },
